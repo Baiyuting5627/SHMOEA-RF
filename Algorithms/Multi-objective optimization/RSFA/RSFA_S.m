@@ -1,0 +1,138 @@
+classdef RSFA_S < ALGORITHM
+% <multi/many> <real/integer/binary/permutation> <constrained>
+% Random-Surrogate Fast Algorithm (Optimized Version)
+% cite 233,   MOKP:M=23,N=10-100
+    methods
+        function main(Algorithm, Problem)
+            %% ================= Parameter Setting =================
+            N          = Problem.N;
+            M          = Problem.M;
+            
+            initRate   = 0.1;           % 初始评估比例（50万次时，0.1=5万次）
+            trainGap   = 20;            % 每10代重训练一次RF
+            realGap    = ceil(N*0.1);   % 每代仅选10%的解进行真实评估
+            ntree      = 20;            % 进一步减少树的数量以提速
+            maxArchive = 800;           % 关键：限制训练集最大样本数
+            gen        = 0;
+
+            %% ================ Initial Population =================
+            % 初始化评估
+            NI = max(N, ceil(Problem.maxFE * initRate));
+            Population = Problem.Initialization(NI);
+            
+            % 如果有 Multiple_Sampling 需求（处理随机问题）
+            % Population = Multiple_Sampling(Problem, Population, 30); 
+            
+            ArchiveDec = Population.decs;
+            ArchiveObj = Population.objs;
+            ArchiveCon = Population.cons;
+
+            %% ================ Initial Surrogate ==================
+            Model = TrainRF(ArchiveDec, ArchiveObj, ArchiveCon, ntree);
+
+            % 截断种群至标准规模 N
+            Population = EnvironmentalSelection(Population, N);
+
+            %% ================= Main Loop =========================
+            while Algorithm.NotTerminated(Population)
+                gen = gen + 1;
+
+                %% ---------- 1 Generate Candidate Offspring -------
+                ParentDec = Population.decs;
+                OffDec    = OperatorGA(Problem, ParentDec);
+                
+                %% ---------- 2 Surrogate Prediction --------------
+                [PredObj, PredCon] = PredictRF(Model, OffDec, M);
+                % 创建模拟个体（不消耗 FE）
+                Dummy = SOLUTION(OffDec, PredObj, PredCon);
+
+                %% ---------- 3 Surrogate Selection ---------------
+                % 在代理模型预测的基础上初步筛选 N 个较好的个体
+                MixPop     = [Population, Dummy];
+                Population = EnvironmentalSelection(MixPop, N);
+
+                %% ---------- 4 Real Evaluation -------------------
+                % 从当前种群中随机/按需选出几个进行真实评估，以更新模型
+                k = min(realGap, size(OffDec, 1));
+                index = randperm(size(OffDec, 1), k);
+                
+                % 真实评估开始
+                RealOff = Problem.Evaluation(OffDec(index, :));
+                
+                % 及时更新 Archive
+                ArchiveDec = [ArchiveDec; RealOff.decs];
+                ArchiveObj = [ArchiveObj; RealOff.objs];
+                ArchiveCon = [ArchiveCon; RealOff.cons];
+                
+                %% 关键改动：限制 Archive 规模，防止后期 RF 训练极慢
+                if size(ArchiveDec, 1) > maxArchive
+                    % 策略：保留最近更新的样本
+                    ArchiveDec = ArchiveDec(end-maxArchive+1:end, :);
+                    ArchiveObj = ArchiveObj(end-maxArchive+1:end, :);
+                    ArchiveCon = ArchiveCon(end-maxArchive+1:end, :);
+                end
+
+                % 将真实评估的个体加入显示种群
+                Population = EnvironmentalSelection([Population, RealOff], N);
+
+                %% ---------- 5 Retrain RF ------------------------
+                % 降低重训练频率
+                if mod(gen, trainGap) == 0
+                    Model = TrainRF(ArchiveDec, ArchiveObj, ArchiveCon, ntree);
+                end
+            end
+        end
+    end
+end
+
+%% ================= RF 训练函数 (加入 MinLeafSize 加速) =================
+function Model = TrainRF(X, Y, C, ntree)
+    Model.obj = cell(1, size(Y, 2));
+    for i = 1:size(Y, 2)
+        Model.obj{i} = TreeBagger(ntree, X, Y(:, i), ...
+            'Method', 'regression', 'OOBPrediction', 'off', 'MinLeafSize', 10);
+    end
+
+    if isempty(C)
+        Model.con = [];
+    else
+        Model.con = cell(1, size(C, 2));
+        for i = 1:size(C, 2)
+            Model.con{i} = TreeBagger(ntree, X, C(:, i), ...
+                'Method', 'regression', 'OOBPrediction', 'off', 'MinLeafSize', 10);
+        end
+    end
+end
+
+%% ================= RF 预测函数 =================
+function [Obj, Con] = PredictRF(Model, X, M)
+    N = size(X, 1);
+    Obj = zeros(N, M);
+    for i = 1:M
+        Obj(:, i) = predict(Model.obj{i}, X);
+    end
+    if isempty(Model.con)
+        Con = zeros(N, 0);
+    else
+        nc = length(Model.con);
+        Con = zeros(N, nc);
+        for i = 1:nc
+            Con(:, i) = predict(Model.con{i}, X);
+        end
+    end
+end
+
+%% ================= 环境选择 =================
+function Population = EnvironmentalSelection(Population, N)
+    if length(Population) <= N
+        return;
+    end
+    % 基于非支配排序和拥挤度的标准选择
+    [FrontNo, MaxFNo] = NDSort(Population.objs, Population.cons, N);
+    Next = FrontNo < MaxFNo;
+    Last = find(FrontNo == MaxFNo);
+    CrowdDis = CrowdingDistance(Population.objs, FrontNo);
+    [~, rank] = sort(CrowdDis(Last), 'descend');
+    Next(Last(rank(1:N - sum(Next)))) = true;
+    Population = Population(Next);
+end
